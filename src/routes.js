@@ -23,6 +23,215 @@ export function hashToken(token) {
 }
 
 /**
+ * Builds a byte-wise sortable key for a semver version so that ORDER BY on the
+ * key reproduces full SemVer precedence, including prerelease identifiers.
+ * Build metadata is ignored, per the semver spec.
+ * @param {string} version - A valid semver version string.
+ * @returns {string} A key ordered identically to semver precedence.
+ */
+export function semverSortKey(version) {
+  const parsed = semver.parse(version);
+  if (!parsed) return version;
+  const pad = (n) => String(n).padStart(20, "0");
+  let key = `${pad(parsed.major)}${pad(parsed.minor)}${pad(parsed.patch)}`;
+  if (parsed.prerelease.length === 0) return `${key}\x7f`;
+  for (const id of parsed.prerelease) {
+    if (/^\d+$/.test(id)) key += `0${pad(id)}!`;
+    else key += `A${id}!`;
+  }
+  return key;
+}
+
+const semverSortKeyRegistered = new WeakSet();
+
+/**
+ * Unicode case-folding table derived from Unicode 16.0 CaseFolding.txt (status
+ * C + F). Contains multi-character expansions (F entries) and common (C)
+ * entries where the case-folded form differs from
+ * {@link String.prototype.toLowerCase}. Characters not listed here are folded
+ * by `toLowerCase`.
+ *
+ * @see https://www.unicode.org/Public/16.0.0/ucd/CaseFolding.txt
+ */
+const FULL_CASE_FOLD = new Map([
+  [0x00b5, "\u03BC"],
+  [0x00df, "\u0073\u0073"],
+  [0x0130, "\u0069\u0307"],
+  [0x0149, "\u02BC\u006E"],
+  [0x017f, "\u0073"],
+  [0x01f0, "\u006A\u030C"],
+  [0x0345, "\u03B9"],
+  [0x0390, "\u03B9\u0308\u0301"],
+  [0x03b0, "\u03C5\u0308\u0301"],
+  [0x03c2, "\u03C3"],
+  [0x0587, "\u0565\u0582"],
+  [0x1c80, "\u0432"],
+  [0x1c81, "\u0434"],
+  [0x1c82, "\u043E"],
+  [0x1c83, "\u0441"],
+  [0x1c84, "\u0442"],
+  [0x1c85, "\u0442"],
+  [0x1c86, "\u044A"],
+  [0x1c87, "\u0463"],
+  [0x1c88, "\uA64B"],
+  [0x1e96, "\u0068\u0331"],
+  [0x1e97, "\u0074\u0308"],
+  [0x1e98, "\u0077\u030A"],
+  [0x1e99, "\u0079\u030A"],
+  [0x1e9a, "\u0061\u02BE"],
+  [0x1e9e, "\u0073\u0073"],
+  [0x1f50, "\u03C5\u0313"],
+  [0x1f52, "\u03C5\u0313\u0300"],
+  [0x1f54, "\u03C5\u0313\u0301"],
+  [0x1f56, "\u03C5\u0313\u0342"],
+  [0x1f80, "\u1F00\u03B9"],
+  [0x1f81, "\u1F01\u03B9"],
+  [0x1f82, "\u1F02\u03B9"],
+  [0x1f83, "\u1F03\u03B9"],
+  [0x1f84, "\u1F04\u03B9"],
+  [0x1f85, "\u1F05\u03B9"],
+  [0x1f86, "\u1F06\u03B9"],
+  [0x1f87, "\u1F07\u03B9"],
+  [0x1f88, "\u1F00\u03B9"],
+  [0x1f89, "\u1F01\u03B9"],
+  [0x1f8a, "\u1F02\u03B9"],
+  [0x1f8b, "\u1F03\u03B9"],
+  [0x1f8c, "\u1F04\u03B9"],
+  [0x1f8d, "\u1F05\u03B9"],
+  [0x1f8e, "\u1F06\u03B9"],
+  [0x1f8f, "\u1F07\u03B9"],
+  [0x1f90, "\u1F20\u03B9"],
+  [0x1f91, "\u1F21\u03B9"],
+  [0x1f92, "\u1F22\u03B9"],
+  [0x1f93, "\u1F23\u03B9"],
+  [0x1f94, "\u1F24\u03B9"],
+  [0x1f95, "\u1F25\u03B9"],
+  [0x1f96, "\u1F26\u03B9"],
+  [0x1f97, "\u1F27\u03B9"],
+  [0x1f98, "\u1F20\u03B9"],
+  [0x1f99, "\u1F21\u03B9"],
+  [0x1f9a, "\u1F22\u03B9"],
+  [0x1f9b, "\u1F23\u03B9"],
+  [0x1f9c, "\u1F24\u03B9"],
+  [0x1f9d, "\u1F25\u03B9"],
+  [0x1f9e, "\u1F26\u03B9"],
+  [0x1f9f, "\u1F27\u03B9"],
+  [0x1fa0, "\u1F60\u03B9"],
+  [0x1fa1, "\u1F61\u03B9"],
+  [0x1fa2, "\u1F62\u03B9"],
+  [0x1fa3, "\u1F63\u03B9"],
+  [0x1fa4, "\u1F64\u03B9"],
+  [0x1fa5, "\u1F65\u03B9"],
+  [0x1fa6, "\u1F66\u03B9"],
+  [0x1fa7, "\u1F67\u03B9"],
+  [0x1fa8, "\u1F60\u03B9"],
+  [0x1fa9, "\u1F61\u03B9"],
+  [0x1faa, "\u1F62\u03B9"],
+  [0x1fab, "\u1F63\u03B9"],
+  [0x1fac, "\u1F64\u03B9"],
+  [0x1fad, "\u1F65\u03B9"],
+  [0x1fae, "\u1F66\u03B9"],
+  [0x1faf, "\u1F67\u03B9"],
+  [0x1fb2, "\u1F70\u03B9"],
+  [0x1fb3, "\u03B1\u03B9"],
+  [0x1fb4, "\u03AC\u03B9"],
+  [0x1fb6, "\u03B1\u0342"],
+  [0x1fb7, "\u03B1\u0342\u03B9"],
+  [0x1fbc, "\u03B1\u03B9"],
+  [0x1fc2, "\u1F74\u03B9"],
+  [0x1fc3, "\u03B7\u03B9"],
+  [0x1fc4, "\u03AE\u03B9"],
+  [0x1fc6, "\u03B7\u0342"],
+  [0x1fc7, "\u03B7\u0342\u03B9"],
+  [0x1fcc, "\u03B7\u03B9"],
+  [0x1fd2, "\u03B9\u0308\u0300"],
+  [0x1fd3, "\u03B9\u0308\u0301"],
+  [0x1fd6, "\u03B9\u0342"],
+  [0x1fd7, "\u03B9\u0308\u0342"],
+  [0x1fe2, "\u03C5\u0308\u0300"],
+  [0x1fe3, "\u03C5\u0308\u0301"],
+  [0x1fe4, "\u03C1\u0313"],
+  [0x1fe6, "\u03C5\u0342"],
+  [0x1fe7, "\u03C5\u0308\u0342"],
+  [0x1ff2, "\u1F7C\u03B9"],
+  [0x1ff3, "\u03C9\u03B9"],
+  [0x1ff4, "\u03CE\u03B9"],
+  [0x1ff6, "\u03C9\u0342"],
+  [0x1ff7, "\u03C9\u0342\u03B9"],
+  [0x1ffc, "\u03C9\u03B9"],
+  [0xfb00, "\u0066\u0066"],
+  [0xfb01, "\u0066\u0069"],
+  [0xfb02, "\u0066\u006C"],
+  [0xfb03, "\u0066\u0066\u0069"],
+  [0xfb04, "\u0066\u0066\u006C"],
+  [0xfb05, "\u0073\u0074"],
+  [0xfb06, "\u0073\u0074"],
+  [0xfb13, "\u0574\u0576"],
+  [0xfb14, "\u0574\u0565"],
+  [0xfb15, "\u0574\u056B"],
+  [0xfb16, "\u057E\u0576"],
+  [0xfb17, "\u0574\u056D"],
+]);
+
+/**
+ * Case-folds a string using the full Unicode case mapping (not just ASCII).
+ * SQLite's built-in LIKE and lower() only fold ASCII (A-Z/a-z), so this is
+ * used for name matching to support non-ASCII case-insensitivity. Applies both
+ * multi-character expansions (e.g. ß/SS) and single-code-point folds where
+ * Unicode case folding differs from {@link String.prototype.toLowerCase}
+ * (e.g. U+017F ſ → "s").
+ * @param {unknown} value - The value to fold.
+ * @returns {string} The case-folded string, or an empty string for NULL.
+ */
+function unicodeFold(value) {
+  if (value == null) return "";
+  const str = String(value).normalize("NFC");
+  let result = "";
+  for (const char of str) {
+    const fold = FULL_CASE_FOLD.get(char.codePointAt(0));
+    result += fold !== undefined ? fold : char.toLowerCase();
+  }
+  return result;
+}
+
+const unicodeFoldRegistered = new WeakSet();
+
+/**
+ * Detects a violation of the partial unique index that allows at most one
+ * staging or pending version per owner, distinguishing it from the per-version
+ * uniqueness constraint.
+ * Determines whether the owner has a staging or pending row by querying the
+ * database state before classifying the conflict. The pending classification
+ * is returned only when that row confirms it; the error-message check is kept
+ * solely as a fallback when the state query cannot determine the result.
+ * @param {unknown} err - The error thrown by better-sqlite3.
+ * @param {import('better-sqlite3').Database} db - The database instance.
+ * @param {number} ownerId - The id of the owner performing the publish.
+ * @param {string} packageId - The package id being published.
+ * @param {string} version - The version being published.
+ * @returns {boolean} True if the error is the one-pending-per-owner violation.
+ */
+function isPendingConflict(err, db, ownerId, packageId, version) {
+  if (
+    db
+      .prepare(
+        `SELECT 1 FROM versions
+         WHERE owner_id = ? AND status IN ('staging', 'pending')
+           AND NOT (package_id = ? AND version = ?)`,
+      )
+      .get(ownerId, packageId, version)
+  ) {
+    return true;
+  }
+  return (
+    err?.code === "SQLITE_CONSTRAINT_UNIQUE" &&
+    typeof err.message === "string" &&
+    err.message.includes("versions.owner_id") &&
+    !err.message.includes("versions.package_id")
+  );
+}
+
+/**
  * Creates and configures the Express application.
  * Sets up all routes for OAuth, publishing, and serving packages.
  * @param {object} options - Configuration options.
@@ -34,6 +243,16 @@ export function hashToken(token) {
 export function createApp({ db, dataDir, config = {} }) {
   const app = express();
   app.use(express.json());
+
+  if (!semverSortKeyRegistered.has(db)) {
+    db.function("semverSortKey", { deterministic: true }, semverSortKey);
+    semverSortKeyRegistered.add(db);
+  }
+
+  if (!unicodeFoldRegistered.has(db)) {
+    db.function("unicode_fold", { deterministic: true }, unicodeFold);
+    unicodeFoldRegistered.add(db);
+  }
 
   app.get("/login", (req, res) => {
     const { GITHUB_CLIENT_ID: clientId } = config;
@@ -251,56 +470,93 @@ export function createApp({ db, dataDir, config = {} }) {
       return;
     }
 
-    const status = owner.has_published === 1 ? "published" : "pending";
-
     const absBlobPath = blobPath(dataDir, ownerName, packageId, version);
     const tempBlobPath = `${absBlobPath}.tmp-${crypto
       .randomBytes(6)
       .toString("hex")}`;
 
+    let finalStatus;
     try {
       fs.mkdirSync(path.dirname(absBlobPath), { recursive: true });
       fs.writeFileSync(tempBlobPath, source);
 
-      const stageVersion = db.transaction(() => {
-        db.prepare(
-          `INSERT INTO versions (owner_id, package_id, version, status, final_status, meta_json, blob_path)
-           VALUES (?, ?, ?, 'staging', ?, ?, ?)`,
-        ).run(
-          owner.id,
-          packageId,
-          version,
-          status,
-          JSON.stringify(meta),
-          absBlobPath,
-        );
-      });
+      const outcome = db
+        .transaction(() => {
+          const current = db
+            .prepare("SELECT has_published FROM owners WHERE id = ?")
+            .get(owner.id);
+          const derivedStatus =
+            current.has_published === 1 ? "published" : "pending";
 
-      try {
-        stageVersion();
-      } catch {
+          const blocked =
+            current.has_published !== 1 &&
+            db
+              .prepare(
+                `SELECT id FROM versions
+                 WHERE owner_id = ? AND status = 'pending'
+                   AND NOT (package_id = ? AND version = ?)`,
+              )
+              .get(owner.id, packageId, version);
+
+          if (blocked) return { blocked: true };
+
+          db.prepare(
+            `INSERT INTO versions (owner_id, package_id, version, status, final_status, meta_json, blob_path)
+             VALUES (?, ?, ?, 'staging', ?, ?, ?)`,
+          ).run(
+            owner.id,
+            packageId,
+            version,
+            derivedStatus,
+            JSON.stringify(meta),
+            absBlobPath,
+          );
+          fs.renameSync(tempBlobPath, absBlobPath);
+          db.prepare(
+            `UPDATE versions SET status = ? WHERE owner_id = ? AND package_id = ? AND version = ?`,
+          ).run(derivedStatus, owner.id, packageId, version);
+
+          return { status: derivedStatus };
+        })
+        .immediate();
+
+      if (outcome.blocked) {
         fs.rmSync(tempBlobPath, { force: true });
+        res.status(409).json({
+          error:
+            "A publish from your account is already awaiting review. Wait for it to be approved before publishing again.",
+        });
+        error(
+          "A publish from your account is already awaiting review. Wait for it to be approved before publishing again.",
+        );
+        return;
+      }
+      finalStatus = outcome.status;
+    } catch (err) {
+      fs.rmSync(tempBlobPath, { force: true });
+      const blobReferenced = db
+        .prepare("SELECT 1 FROM versions WHERE blob_path = ?")
+        .get(absBlobPath);
+      if (!blobReferenced) {
+        fs.rmSync(absBlobPath, { force: true });
+      }
+      if (err.code === "SQLITE_CONSTRAINT_UNIQUE") {
+        if (isPendingConflict(err, db, owner.id, packageId, version)) {
+          res.status(409).json({
+            error:
+              "A publish from your account is already awaiting review. Wait for it to be approved before publishing again.",
+          });
+          error(
+            "A publish from your account is already awaiting review. Wait for it to be approved before publishing again.",
+          );
+          return;
+        }
         res
           .status(409)
           .json({ error: "This version already exists for this owner." });
         error("This version already exists for this owner.");
         return;
       }
-
-      try {
-        fs.renameSync(tempBlobPath, absBlobPath);
-      } catch (err) {
-        db.prepare(
-          `DELETE FROM versions WHERE owner_id = ? AND package_id = ? AND version = ?`,
-        ).run(owner.id, packageId, version);
-        throw err;
-      }
-
-      db.prepare(
-        `UPDATE versions SET status = ? WHERE owner_id = ? AND package_id = ? AND version = ?`,
-      ).run(status, owner.id, packageId, version);
-    } catch (err) {
-      fs.rmSync(tempBlobPath, { force: true });
       next(err);
       return;
     }
@@ -309,11 +565,183 @@ export function createApp({ db, dataDir, config = {} }) {
       owner: ownerName,
       id: packageId,
       version,
-      status,
+      status: finalStatus,
       url: `/v1/${ownerName}/${packageId}/${version}`,
     });
 
-    success(`${ownerName}/${packageId}@${version} (${status})`);
+    success(`${ownerName}/${packageId}@${version} (${finalStatus})`);
+  });
+
+  const latestPublishedSelections = `
+    SELECT o.github_username AS owner, v.package_id AS id,
+           v.meta_json AS meta_json, v.version AS latestVersion,
+           v.created_at AS created_at,
+           ROW_NUMBER() OVER (
+             PARTITION BY v.owner_id, v.package_id
+             ORDER BY semverSortKey(v.version) DESC, v.id DESC
+           ) AS rn
+    FROM versions v
+    JOIN owners o ON o.id = v.owner_id
+    WHERE v.status = 'published'
+  `;
+
+  app.get("/v1/search", (req, res) => {
+    const q = typeof req.query.q === "string" ? req.query.q.trim() : "";
+    if (!q) {
+      res.status(400).json({ error: "Missing required `q` query parameter." });
+      error("Missing required `q` query parameter.");
+      return;
+    }
+    const escaped = q
+      .replace(/\\/g, "\\\\")
+      .replace(/%/g, "\\%")
+      .replace(/_/g, "\\_");
+    const pattern = `%${escaped}%`;
+    const rows = db
+      .prepare(
+        `SELECT owner, id, meta_json, latestVersion
+         FROM (${latestPublishedSelections}) t
+         WHERE t.rn = 1
+           AND (unicode_fold(json_extract(t.meta_json, '$.name'))
+                  LIKE unicode_fold(?) ESCAPE '\\'
+             OR json_extract(t.meta_json, '$.version') LIKE ? ESCAPE '\\'
+             OR json_extract(t.meta_json, '$.license') LIKE ? ESCAPE '\\'
+             OR json_extract(t.meta_json, '$.description') LIKE ? ESCAPE '\\'
+             OR t.id LIKE ? ESCAPE '\\'
+             OR t.owner LIKE ? ESCAPE '\\')
+         ORDER BY t.created_at DESC, t.owner ASC, t.id ASC
+         LIMIT 10`,
+      )
+      .all(pattern, pattern, pattern, pattern, pattern, pattern);
+    res.json({
+      results: rows.map((r) => {
+        const meta = JSON.parse(r.meta_json);
+        return {
+          owner: r.owner,
+          id: r.id,
+          name: meta.name,
+          description: meta.description,
+          latestVersion: r.latestVersion,
+        };
+      }),
+    });
+  });
+
+  app.get("/v1/packages", (req, res) => {
+    let limit = 20;
+    if (req.query.limit !== undefined) {
+      const parsed = Number(req.query.limit);
+      if (!Number.isInteger(parsed) || parsed <= 0) {
+        res.status(400).json({ error: "limit must be a positive integer." });
+        return;
+      }
+      limit = parsed;
+    }
+    limit = Math.min(limit, 50);
+
+    let cursor = null;
+    if (req.query.cursor !== undefined && req.query.cursor !== "") {
+      let decoded;
+      try {
+        decoded = JSON.parse(
+          Buffer.from(req.query.cursor, "base64").toString("utf8"),
+        );
+      } catch {
+        res.status(400).json({ error: "Invalid cursor." });
+        return;
+      }
+      if (
+        !decoded ||
+        typeof decoded !== "object" ||
+        typeof decoded.createdAt !== "string" ||
+        typeof decoded.owner !== "string" ||
+        typeof decoded.packageId !== "string"
+      ) {
+        res.status(400).json({ error: "Invalid cursor." });
+        return;
+      }
+      cursor = decoded;
+    }
+
+    let where = "WHERE t.rn = 1";
+    const params = [];
+    if (cursor) {
+      where += ` AND (
+        t.created_at < ? OR
+        (t.created_at = ? AND (t.owner > ? OR (t.owner = ? AND t.id > ?)))
+      )`;
+      params.push(
+        cursor.createdAt,
+        cursor.createdAt,
+        cursor.owner,
+        cursor.owner,
+        cursor.packageId,
+      );
+    }
+
+    const rows = db
+      .prepare(
+        `SELECT t.owner, t.id, t.meta_json, t.latestVersion, t.created_at
+         FROM (${latestPublishedSelections}) t
+         ${where}
+         ORDER BY t.created_at DESC, t.owner ASC, t.id ASC
+         LIMIT ?`,
+      )
+      .all(...params, limit + 1);
+
+    const hasMore = rows.length > limit;
+    const page = rows.slice(0, limit);
+
+    let nextCursor = null;
+    if (hasMore) {
+      const last = page[page.length - 1];
+      nextCursor = Buffer.from(
+        JSON.stringify({
+          createdAt: last.created_at,
+          owner: last.owner,
+          packageId: last.id,
+        }),
+      ).toString("base64");
+    }
+
+    res.json({
+      packages: page.map((r) => {
+        const meta = JSON.parse(r.meta_json);
+        return {
+          owner: r.owner,
+          id: r.id,
+          name: meta.name,
+          description: meta.description,
+          latestVersion: r.latestVersion,
+          publishedAt: r.created_at,
+        };
+      }),
+      nextCursor,
+    });
+  });
+
+  app.get("/v1/stats", (req, res) => {
+    const published = db
+      .prepare(
+        `SELECT COUNT(*) AS c FROM (
+           SELECT 1 FROM versions WHERE status = 'published'
+           GROUP BY owner_id, package_id
+         )`,
+      )
+      .get().c;
+    const pending = db
+      .prepare(`SELECT COUNT(*) AS c FROM versions WHERE status = 'pending'`)
+      .get().c;
+    const authors = db
+      .prepare(
+        `SELECT COUNT(*) AS c FROM (
+           SELECT 1 FROM versions WHERE status = 'published'
+           GROUP BY owner_id
+         )`,
+      )
+      .get().c;
+
+    res.json({ published, pending, authors });
   });
 
   app.get("/v1/:owner/:id", (req, res) => {

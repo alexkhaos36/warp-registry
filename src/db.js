@@ -73,6 +73,20 @@ export function openDatabase(dataDir) {
   db.pragma("journal_mode = WAL");
   db.exec(SCHEMA);
   migrateSchema(db);
+  db.exec(
+    `DELETE FROM versions
+     WHERE status IN ('staging', 'pending')
+       AND id NOT IN (
+         SELECT MIN(id) FROM versions
+         WHERE status IN ('staging', 'pending')
+         GROUP BY owner_id
+       )`,
+  );
+  db.exec(
+    `CREATE UNIQUE INDEX IF NOT EXISTS versions_one_pending_per_owner
+     ON versions (owner_id)
+     WHERE status IN ('staging', 'pending')`,
+  );
   return db;
 }
 

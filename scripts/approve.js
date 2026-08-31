@@ -33,15 +33,22 @@ const approve = db.transaction(() => {
   const result = db
     .prepare(
       `UPDATE versions SET status = 'published'
-       WHERE owner_id = ? AND package_id = ? AND version = ?`,
+         WHERE owner_id = ? AND package_id = ? AND version = ?
+           AND status = 'pending'`,
     )
     .run(owner.id, packageId, version);
 
   if (result.changes === 0) return false;
 
   db.prepare("UPDATE owners SET has_published = 1 WHERE id = ?").run(owner.id);
+
+  db.prepare(
+    `DELETE FROM versions
+       WHERE owner_id = ?
+         AND status IN ('staging', 'pending')`,
+  ).run(owner.id);
   return true;
-});
+}).immediate;
 
 if (!approve()) {
   error(`No version found for ${username}/${packageId}@${version}`);
