@@ -3,20 +3,38 @@ import fs from "node:fs";
 import path from "node:path";
 
 /**
+ * Regular expression for validating user namespaces.
+ * Namespaces must start with a lowercase alphanumeric character and can contain hyphens.
+ * Kept here as the single source of truth so migrations classify GitHub usernames
+ * the same way the signup endpoint does.
+ */
+export const NAMESPACE_RE = /^[a-z0-9](?:[a-z0-9-]{0,38}[a-z0-9])?$/;
+
+/**
  * SQL schema definition for the database.
- * Creates tables for owners and versions with their constraints.
+ * Creates tables for users, auth tokens, and versions with their constraints.
  */
 export const SCHEMA = `
-CREATE TABLE IF NOT EXISTS owners (
+CREATE TABLE IF NOT EXISTS users (
   id INTEGER PRIMARY KEY,
-  github_username TEXT UNIQUE NOT NULL,
-  token_hash TEXT NOT NULL,
+  namespace TEXT UNIQUE NOT NULL,
+  display_name TEXT NOT NULL DEFAULT '',
+  password_hash TEXT NOT NULL DEFAULT '',
+  type TEXT NOT NULL CHECK (type IN ('admin', 'normal')) DEFAULT 'normal',
   has_published INTEGER NOT NULL DEFAULT 0
+);
+
+CREATE TABLE IF NOT EXISTS auth_tokens (
+  id INTEGER PRIMARY KEY,
+  user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+  token_hash TEXT UNIQUE NOT NULL,
+  created_at TEXT NOT NULL DEFAULT (datetime('now')),
+  expires_at TEXT
 );
 
 CREATE TABLE IF NOT EXISTS versions (
   id INTEGER PRIMARY KEY,
-  owner_id INTEGER NOT NULL REFERENCES owners(id),
+  owner_id INTEGER NOT NULL REFERENCES users(id),
   package_id TEXT NOT NULL,
   version TEXT NOT NULL,
   status TEXT NOT NULL CHECK (status IN ('staging', 'pending', 'published')),
@@ -29,20 +47,86 @@ CREATE TABLE IF NOT EXISTS versions (
 `;
 
 /**
- * Migrates the database schema to add the final_status column if needed.
+ * Migrates the database schema from v1 (owners) to v2 (users).
+ * Only runs if the old owners table exists and the new users table does not.
  * Wraps the migration in a transaction for safety.
+ *
+ * Recovered-account note: v1 owners authenticated via GitHub OAuth, so they have
+ * no password. The migration copies them with an empty password_hash. A migrated
+ * account cannot log in with a password and instead requires a one-time recovery:
+ *
+ *   1. An admin sets a password via the CLI, or the account owner uses
+ *      `PATCH /v2/users/:namespace` (requires an admin-issued token) to set one.
+ *
+ * Until a password is set the account cannot authenticate through the normal login flow.
+ *
  * @param {import('better-sqlite3').Database} db - The database instance.
  */
 function migrateSchema(db) {
-  const versions = db
+  const hasUsers = db
     .prepare(
-      "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'versions'",
+      "SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'users'",
     )
     .get();
-  if (versions && /final_status/.test(versions.sql)) return;
+  if (hasUsers) return;
+
+  const hasOwners = db
+    .prepare(
+      "SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'owners'",
+    )
+    .get();
+
+  if (!hasOwners) return;
 
   db.exec("BEGIN");
   try {
+    db.exec(
+      `CREATE TABLE users (
+        id INTEGER PRIMARY KEY,
+        namespace TEXT UNIQUE NOT NULL,
+        display_name TEXT NOT NULL DEFAULT '',
+        password_hash TEXT NOT NULL DEFAULT '',
+        type TEXT NOT NULL CHECK (type IN ('admin', 'normal')) DEFAULT 'normal',
+        has_published INTEGER NOT NULL DEFAULT 0
+      )`,
+    );
+
+    const owners = db
+      .prepare(
+        "SELECT id, github_username, has_published FROM owners ORDER BY id",
+      )
+      .all();
+    const usedNamespaces = new Set();
+    const insertUser = db.prepare(
+      "INSERT INTO users (id, namespace, password_hash, has_published) VALUES (?, ?, '', ?)",
+    );
+    for (const owner of owners) {
+      let namespace = String(owner.github_username || "")
+        .trim()
+        .toLowerCase();
+      if (!NAMESPACE_RE.test(namespace)) {
+        namespace = `user${owner.id}`;
+      }
+      let candidate = namespace;
+      let suffix = 0;
+      while (usedNamespaces.has(candidate)) {
+        suffix += 1;
+        candidate = `${namespace}${suffix}`;
+      }
+      usedNamespaces.add(candidate);
+      insertUser.run(owner.id, candidate, owner.has_published);
+    }
+
+    db.exec(
+      `CREATE TABLE IF NOT EXISTS auth_tokens (
+        id INTEGER PRIMARY KEY,
+        user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+        token_hash TEXT UNIQUE NOT NULL,
+        created_at TEXT NOT NULL DEFAULT (datetime('now')),
+        expires_at TEXT
+      )`,
+    );
+
     db.exec("ALTER TABLE versions RENAME TO versions_old");
     db.exec(SCHEMA);
     db.exec(
@@ -53,6 +137,9 @@ function migrateSchema(db) {
        FROM versions_old`,
     );
     db.exec("DROP TABLE versions_old");
+
+    db.exec(`DROP TABLE owners`);
+
     db.exec("COMMIT");
   } catch (err) {
     db.exec("ROLLBACK");
@@ -71,8 +158,9 @@ export function openDatabase(dataDir) {
   const dbPath = path.join(dataDir, "registry.db");
   const db = new Database(dbPath);
   db.pragma("journal_mode = WAL");
-  db.exec(SCHEMA);
+  db.pragma("foreign_keys = ON");
   migrateSchema(db);
+  db.exec(SCHEMA);
   db.exec(
     `DELETE FROM versions
      WHERE status IN ('staging', 'pending')
@@ -102,7 +190,7 @@ export function blobsDir(dataDir) {
 /**
  * Constructs the file system path for a specific package version blob.
  * @param {string} dataDir - The data directory path.
- * @param {string} owner - The package owner's username.
+ * @param {string} owner - The package owner's namespace.
  * @param {string} packageId - The package identifier.
  * @param {string} version - The package version.
  * @returns {string} The full path to the blob file.

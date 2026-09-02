@@ -3,7 +3,7 @@ import fs from "node:fs";
 import path from "node:path";
 import express from "express";
 import semver from "semver";
-import { blobPath, blobsDir } from "./db.js";
+import { NAMESPACE_RE, blobPath, blobsDir } from "./db.js";
 import { extractWarpMeta } from "./warp-meta.js";
 import { success, error } from "./logger.js";
 
@@ -20,6 +20,158 @@ export const PACKAGE_ID_RE = /^[a-z0-9](?:[a-z0-9._-]{0,63})$/;
  */
 export function hashToken(token) {
   return crypto.createHash("sha256").update(token).digest("hex");
+}
+
+/**
+ * Hashes a password using scrypt with a random salt.
+ * @param {string} password - The password to hash.
+ * @returns {string} The salt:hash pair in hex format.
+ */
+const SCRYPT_PARAMS = { N: 16384, r: 8, p: 1 };
+
+/**
+ * Lifetime of an issued auth token in milliseconds (7 days).
+ */
+const TOKEN_TTL_MS = 7 * 24 * 60 * 60 * 1000;
+
+/**
+ * Auth rate-limit configuration: at most MAX consecutive failed attempts over
+ * the window before the client is throttled with 429.
+ */
+const RATE_LIMIT_MAX = 5;
+const RATE_LIMIT_WINDOW_MS = 15 * 60 * 1000;
+
+/**
+ * Fixed page size used for paginated /search results.
+ */
+const SEARCH_PAGE_SIZE = 10;
+
+/**
+ * Simple in-memory rate limiter keyed by `namespace|ip`.
+ * Tracks failed attempts for a rolling window. Not sharded or persisted; a
+ * restart resets the counters.
+ */
+function createRateLimiter() {
+  const buckets = new Map();
+  function sweep() {
+    const now = Date.now();
+    for (const [key, entry] of buckets) {
+      if (now - entry.firstAttemptAt > RATE_LIMIT_WINDOW_MS) {
+        buckets.delete(key);
+      }
+    }
+  }
+  return {
+    onFailure(key, now = Date.now()) {
+      sweep();
+      let entry = buckets.get(key);
+      if (!entry) {
+        entry = { count: 0, firstAttemptAt: now };
+        buckets.set(key, entry);
+      }
+      entry.count += 1;
+      return entry.count >= RATE_LIMIT_MAX;
+    },
+    onSuccess(key) {
+      buckets.delete(key);
+    },
+  };
+}
+
+/**
+ * Per-IP limiter that counts successful signup requests. Unlike
+ * createRateLimiter, failed/rejected attempts do not count; only successful
+ * account creations consume the bucket so an IP cannot churn out unlimited
+ * accounts within the window.
+ */
+function createSignupLimiter() {
+  const buckets = new Map();
+  function sweep(now = Date.now()) {
+    for (const [key, entry] of buckets) {
+      if (now - entry.firstAt > RATE_LIMIT_WINDOW_MS) {
+        buckets.delete(key);
+      }
+    }
+  }
+  return {
+    isLimited(key, now = Date.now()) {
+      sweep(now);
+      const entry = buckets.get(key);
+      return !!entry && entry.count >= RATE_LIMIT_MAX;
+    },
+    reserve(key, now = Date.now()) {
+      sweep(now);
+      const entry = buckets.get(key);
+      if (!entry) {
+        buckets.set(key, { count: 0, reserved: 1, firstAt: now });
+        return true;
+      }
+      if (entry.count + entry.reserved >= RATE_LIMIT_MAX) {
+        return false;
+      }
+      entry.reserved += 1;
+      return true;
+    },
+    release(key) {
+      const entry = buckets.get(key);
+      if (entry && entry.reserved > 0) {
+        entry.reserved -= 1;
+      }
+    },
+    recordSuccess(key, now = Date.now()) {
+      sweep(now);
+      const entry = buckets.get(key);
+      if (entry) {
+        entry.count += 1;
+        if (entry.reserved > 0) {
+          entry.reserved -= 1;
+        }
+      } else {
+        buckets.set(key, { count: 1, reserved: 0, firstAt: now });
+      }
+    },
+  };
+}
+
+/**
+ * Hashes a password using scrypt with a random salt, asynchronously.
+ * @param {string} password - The password to hash.
+ * @returns {Promise<string>} A promise resolving to the salt:hash pair in hex format.
+ */
+export async function hashPassword(password) {
+  const salt = crypto.randomBytes(16).toString("hex");
+  const hash = await new Promise((resolve, reject) => {
+    crypto.scrypt(password, salt, 64, SCRYPT_PARAMS, (err, derivedKey) => {
+      if (err) reject(err);
+      else resolve(derivedKey.toString("hex"));
+    });
+  });
+  return `${salt}:${hash}`;
+}
+
+/**
+ * Verifies a password against a stored hash, asynchronously.
+ * @param {string} password - The password to verify.
+ * @param {string} stored - The stored salt:hash pair.
+ * @returns {Promise<boolean>} Resolves true if the password matches.
+ */
+export async function verifyPassword(password, stored) {
+  const [salt, hash] = stored.split(":");
+  if (!salt || !hash) return false;
+  const computed = await new Promise((resolve, reject) => {
+    crypto.scrypt(password, salt, 64, SCRYPT_PARAMS, (err, derivedKey) => {
+      if (err) reject(err);
+      else resolve(derivedKey.toString("hex"));
+    });
+  });
+  try {
+    return crypto.timingSafeEqual(
+      Buffer.from(hash, "hex"),
+      Buffer.from(computed, "hex"),
+    );
+  } catch {
+    return false;
+  }
 }
 
 /**
@@ -200,10 +352,6 @@ const unicodeFoldRegistered = new WeakSet();
  * Detects a violation of the partial unique index that allows at most one
  * staging or pending version per owner, distinguishing it from the per-version
  * uniqueness constraint.
- * Determines whether the owner has a staging or pending row by querying the
- * database state before classifying the conflict. The pending classification
- * is returned only when that row confirms it; the error-message check is kept
- * solely as a fallback when the state query cannot determine the result.
  * @param {unknown} err - The error thrown by better-sqlite3.
  * @param {import('better-sqlite3').Database} db - The database instance.
  * @param {number} ownerId - The id of the owner performing the publish.
@@ -232,15 +380,86 @@ function isPendingConflict(err, db, ownerId, packageId, version) {
 }
 
 /**
+ * Authenticates a request by extracting and validating the Bearer token.
+ * @param {import('better-sqlite3').Database} db - The database instance.
+ * @param {string} authHeader - The Authorization header value.
+ * @returns {{user: object, tokenHash: string}|null} The authenticated user and token hash, or null.
+ */
+function authenticate(db, authHeader) {
+  const match = /^Bearer\s+(.+)$/i.exec(authHeader || "");
+  if (!match) return null;
+  const token = match[1].trim();
+  const tokenHash = hashToken(token);
+  const row = db
+    .prepare(
+      `SELECT u.*, t.id AS token_id, t.expires_at
+       FROM auth_tokens t JOIN users u ON u.id = t.user_id
+       WHERE t.token_hash = ?`,
+    )
+    .get(tokenHash);
+  if (!row) return null;
+  if (row.expires_at && new Date(row.expires_at) < new Date()) {
+    db.prepare("DELETE FROM auth_tokens WHERE id = ?").run(row.token_id);
+    return null;
+  }
+  return { user: row, tokenHash };
+}
+
+/**
+ * Builds a User response object from a database row.
+ * @param {object} row - The user database row.
+ * @param {import('better-sqlite3').Database} db - The database instance.
+ * @returns {object} The User response object.
+ */
+function userResponse(row, db) {
+  const extensions = db
+    .prepare(
+      `SELECT DISTINCT package_id FROM versions
+       WHERE owner_id = ? AND status = 'published'`,
+    )
+    .all(row.id)
+    .map((r) => r.package_id);
+  return {
+    id: row.id,
+    displayName: row.display_name,
+    namespace: row.namespace,
+    type: row.type,
+    extensions,
+  };
+}
+
+/**
+ * Decodes and validates an opaque pagination cursor.
+ * A cursor is a base64-encoded JSON object. Returns `{ ok: false }` when the
+ * cursor is malformed or fails the caller-supplied shape validation, otherwise
+ * `{ ok: true, value }` where `value` is null when no cursor was provided.
+ * @param {string|undefined} raw - The raw query parameter value.
+ * @param {(decoded: object) => boolean} validate - Shape validation predicate.
+ * @returns {{ ok: boolean, value?: object|null }}
+ */
+function decodeCursor(raw, validate) {
+  if (raw === undefined || raw === "") return { ok: true, value: null };
+  let decoded;
+  try {
+    decoded = JSON.parse(Buffer.from(raw, "base64").toString("utf8"));
+  } catch {
+    return { ok: false };
+  }
+  if (!decoded || typeof decoded !== "object" || !validate(decoded)) {
+    return { ok: false };
+  }
+  return { ok: true, value: decoded };
+}
+
+/**
  * Creates and configures the Express application.
- * Sets up all routes for OAuth, publishing, and serving packages.
+ * Sets up all v2 routes for auth, user management, publishing, and discovery.
  * @param {object} options - Configuration options.
  * @param {import('better-sqlite3').Database} options.db - The database instance.
  * @param {string} options.dataDir - The data directory path.
- * @param {object} [options.config={}] - Optional configuration for GitHub OAuth and public URL.
  * @returns {import('express').Express} The configured Express app.
  */
-export function createApp({ db, dataDir, config = {} }) {
+export function createApp({ db, dataDir }) {
   const app = express();
   app.use(express.json());
 
@@ -254,189 +473,358 @@ export function createApp({ db, dataDir, config = {} }) {
     unicodeFoldRegistered.add(db);
   }
 
-  app.get("/login", (req, res) => {
-    const { GITHUB_CLIENT_ID: clientId } = config;
-    if (!clientId) {
-      res
-        .status(500)
-        .send("GitHub OAuth is not configured (missing GITHUB_CLIENT_ID).");
-      return;
-    }
-    const redirectUri = config.PUBLIC_BASE_URL
-      ? `${config.PUBLIC_BASE_URL}/callback`
-      : `${req.protocol}://${req.get("host")}/callback`;
-    const state = crypto.randomBytes(16).toString("hex");
-    setStateCookie(res, state, config);
-    const params = new URLSearchParams({
-      client_id: clientId,
-      redirect_uri: redirectUri,
-      scope: "read:user",
-      state,
-    });
-    res.redirect(
-      `https://github.com/login/oauth/authorize?${params.toString()}`,
-    );
-  });
+  // ── Auth routes ──────────────────────────────────────────────────────
 
-  app.get("/callback", async (req, res) => {
-    const { code } = req.query;
-    if (!code) {
-      res.status(400).send("Missing `code` query parameter.");
-      return;
-    }
-    const state = req.query.state;
-    if (typeof state !== "string" || !verifyState(req, state, config)) {
-      res.status(400).send("Missing or invalid OAuth state.");
-      return;
-    }
-    const { GITHUB_CLIENT_ID: clientId, GITHUB_CLIENT_SECRET: clientSecret } =
-      config;
-    if (!clientId || !clientSecret) {
-      res.status(500).send("GitHub OAuth is not configured.");
-      return;
-    }
-    try {
-      const tokenRes = await fetch(
-        "https://github.com/login/oauth/access_token",
-        {
-          method: "POST",
-          headers: {
-            "Content-Type": "application/json",
-            Accept: "application/json",
-          },
-          body: JSON.stringify({
-            client_id: clientId,
-            client_secret: clientSecret,
-            code,
-          }),
-        },
-      );
-      if (!tokenRes.ok) {
-        throw new Error(
-          `GitHub token exchange failed with status ${tokenRes.status}`,
-        );
-      }
-      const tokenData = await tokenRes.json();
-      if (tokenData.error) {
-        throw new Error(`GitHub token exchange error: ${tokenData.error}`);
-      }
-      const accessToken = tokenData.access_token;
-      if (!accessToken) {
-        throw new Error("GitHub did not return an access token.");
-      }
+  const rateLimiter = createRateLimiter();
+  const signupLimiter = createSignupLimiter();
 
-      const userRes = await fetch("https://api.github.com/user", {
-        headers: {
-          Authorization: `Bearer ${accessToken}`,
-          Accept: "application/vnd.github+json",
-        },
-      });
-      if (!userRes.ok) {
-        throw new Error(
-          `GitHub user fetch failed with status ${userRes.status}`,
-        );
-      }
-      const user = await userRes.json();
-      const username = user.login;
-      if (!username) {
-        throw new Error("GitHub did not return a username.");
-      }
+  const rateLimited = (res) => {
+    res.status(429).json({ error: "Too many attempts. Try again later." });
+  };
 
-      const token = crypto.randomBytes(32).toString("hex");
-      const tokenHash = hashToken(token);
+  const clientIp = (req) =>
+    req.ip || (req.socket && req.socket.remoteAddress) || "unknown";
 
-      db.prepare(
-        `INSERT INTO owners (github_username, token_hash, has_published)
-         VALUES (?, ?, 0)
-         ON CONFLICT(github_username) DO UPDATE SET token_hash = excluded.token_hash`,
-      ).run(username, tokenHash);
-
-      success(`OAuth token issued for ${username}`);
-
-      res.setHeader("Content-Type", "text/html; charset=utf-8");
-      res.status(200).send(`<!doctype html>
-<html lang="en">
-  <head><meta charset="utf-8"><title>Warp Registry — Token</title></head>
-  <body>
-    <h1>Warp Registry</h1>
-    <p>Welcome, <strong>${escapeHtml(username)}</strong>.</p>
-    <p>Your access token is:</p>
-    <pre style="user-select: all;">${escapeHtml(token)}</pre>
-    <p><strong>This token will not be shown again.</strong> Store it somewhere safe.
-    Use it as the value of the <code>Authorization: Bearer &lt;token&gt;</code> header
-    when publishing.</p>
-  </body>
-</html>`);
-    } catch (err) {
-      console.error(err);
-      res.status(500).send("GitHub OAuth failed. See server logs for details.");
-    }
-  });
-
-  app.post("/v1/publish", async (req, res, next) => {
-    const authHeader = req.headers.authorization || "";
-    const match = /^Bearer\s+(.+)$/i.exec(authHeader);
-    if (!match) {
-      res
-        .status(401)
-        .json({ error: "Missing Bearer token in Authorization header." });
-      return;
-    }
-    const token = match[1].trim();
-    const tokenHash = hashToken(token);
-    const owner = db
-      .prepare("SELECT * FROM owners WHERE token_hash = ?")
-      .get(tokenHash);
-    if (!owner) {
-      res.status(401).json({ error: "Invalid token." });
-      error("Invalid token.");
-      return;
-    }
-
-    const contentType = req.headers["content-type"] || "";
-    if (
-      !contentType.startsWith("application/javascript") &&
-      !contentType.startsWith("text/plain")
-    ) {
-      res.status(400).json({
-        error: "Content-Type must be application/javascript or text/plain.",
-      });
-      error("Content-Type must be application/javascript or text/plain.");
-      return;
-    }
-
-    let source;
-    try {
-      source = await readRawBody(req);
-    } catch (bodyErr) {
-      if (bodyErr && bodyErr.statusCode === 413) {
-        res.status(413).json({ error: "Request body too large." });
-        error("Request body too large.");
+  app.post("/v2/auth/signup", async (req, res) => {
+    const { namespace, displayName, password } = req.body || {};
+    const rateKey = `signup:${clientIp(req)}`;
+    const reject = (status, error) => {
+      if (rateLimiter.onFailure(rateKey)) {
+        rateLimited(res);
         return;
       }
-      res.status(400).json({ error: "Failed to read request body." });
-      error("Failed to read request body.");
+      res.status(status).json({ error });
+    };
+
+    if (!namespace || typeof namespace !== "string") {
+      reject(400, "namespace is required.");
+      return;
+    }
+    if (!NAMESPACE_RE.test(namespace)) {
+      reject(
+        400,
+        "namespace must match ^[a-z0-9](?:[a-z0-9-]{0,38}[a-z0-9])?$.",
+      );
+      return;
+    }
+    if (!password || typeof password !== "string" || password.length < 8) {
+      reject(400, "password must be at least 8 characters.");
+      return;
+    }
+    if (displayName !== undefined && typeof displayName !== "string") {
+      reject(400, "displayName must be a string.");
       return;
     }
 
-    const { ok, meta, error: metaError } = extractWarpMeta(source);
+    if (signupLimiter.isLimited(rateKey)) {
+      rateLimited(res);
+      return;
+    }
+    if (!signupLimiter.reserve(rateKey)) {
+      rateLimited(res);
+      return;
+    }
+
+    const existing = db
+      .prepare("SELECT id FROM users WHERE namespace = ?")
+      .get(namespace);
+    if (existing) {
+      signupLimiter.release(rateKey);
+      reject(409, "Namespace already exists.");
+      return;
+    }
+
+    const passwordHash = await hashPassword(password);
+
+    let result;
+    try {
+      result = db
+        .prepare(
+          `INSERT INTO users (namespace, display_name, password_hash, type)
+           VALUES (?, ?, ?, 'normal')`,
+        )
+        .run(namespace, displayName || "", passwordHash);
+    } catch (err) {
+      signupLimiter.release(rateKey);
+      if (err.code === "SQLITE_CONSTRAINT_UNIQUE") {
+        reject(409, "Namespace already exists.");
+        return;
+      }
+      throw err;
+    }
+
+    signupLimiter.recordSuccess(rateKey);
+
+    const user = db
+      .prepare("SELECT * FROM users WHERE id = ?")
+      .get(result.lastInsertRowid);
+
+    const token = crypto.randomBytes(32).toString("hex");
+    const tokenHash = hashToken(token);
+    const expiresAt = new Date(Date.now() + TOKEN_TTL_MS).toISOString();
+    db.prepare(
+      "INSERT INTO auth_tokens (user_id, token_hash, expires_at) VALUES (?, ?, ?)",
+    ).run(user.id, tokenHash, expiresAt);
+
+    success(`User signed up: ${namespace}`);
+    res.status(201).json({ user: userResponse(user, db), token });
+  });
+
+  app.post("/v2/auth/login", async (req, res) => {
+    const { namespace, password } = req.body || {};
+    if (!namespace || typeof namespace !== "string") {
+      res.status(400).json({ error: "namespace is required." });
+      return;
+    }
+    if (!password || typeof password !== "string") {
+      res.status(400).json({ error: "password is required." });
+      return;
+    }
+
+    const rateKey = `login:${namespace}|${clientIp(req)}`;
+    if (rateLimiter.onFailure(rateKey)) {
+      rateLimited(res);
+      return;
+    }
+
+    const user = db
+      .prepare("SELECT * FROM users WHERE namespace = ?")
+      .get(namespace);
+    const ok = user && (await verifyPassword(password, user.password_hash));
+    if (!user || !ok) {
+      res.status(401).json({ error: "Invalid credentials." });
+      return;
+    }
+    rateLimiter.onSuccess(rateKey);
+
+    const token = crypto.randomBytes(32).toString("hex");
+    const tokenHash = hashToken(token);
+    const expiresAt = new Date(Date.now() + TOKEN_TTL_MS).toISOString();
+    db.prepare(
+      "INSERT INTO auth_tokens (user_id, token_hash, expires_at) VALUES (?, ?, ?)",
+    ).run(user.id, tokenHash, expiresAt);
+
+    success(`User logged in: ${namespace}`);
+    res.status(200).json({ user: userResponse(user, db), token });
+  });
+
+  app.post("/v2/auth/logout", (req, res) => {
+    const auth = authenticate(db, req.headers.authorization);
+    if (!auth) {
+      res.status(401).json({ error: "Unauthorized." });
+      return;
+    }
+    db.prepare("DELETE FROM auth_tokens WHERE token_hash = ?").run(
+      auth.tokenHash,
+    );
+    res.status(200).json({ message: "Logged out." });
+  });
+
+  // ── User routes ──────────────────────────────────────────────────────
+
+  app.get("/v2/users", (req, res) => {
+    let limit = 20;
+    if (req.query.limit !== undefined) {
+      const parsed = Number(req.query.limit);
+      if (!Number.isInteger(parsed) || parsed < 1) {
+        res.status(400).json({ error: "limit must be a positive integer." });
+        return;
+      }
+      limit = parsed;
+    }
+    limit = Math.min(limit, 50);
+
+    const cursor = decodeCursor(
+      req.query.cursor,
+      (d) => typeof d.id === "number",
+    );
+    if (!cursor.ok) {
+      res.status(400).json({ error: "Invalid cursor." });
+      return;
+    }
+    const cursorId = cursor.value ? cursor.value.id : null;
+
+    const where = cursorId !== null ? "WHERE id > ?" : "";
+    const params = cursorId !== null ? [cursorId] : [];
+
+    const rows = db
+      .prepare(`SELECT * FROM users ${where} ORDER BY id ASC LIMIT ?`)
+      .all(...params, limit + 1);
+
+    const hasMore = rows.length > limit;
+    const page = rows.slice(0, limit);
+
+    let nextCursor = null;
+    if (hasMore) {
+      nextCursor = Buffer.from(
+        JSON.stringify({ id: page[page.length - 1].id }),
+      ).toString("base64");
+    }
+
+    res.json({
+      users: page.map((r) => userResponse(r, db)),
+      nextCursor,
+    });
+  });
+
+  app.get("/v2/users/:namespace", (req, res) => {
+    const user = db
+      .prepare("SELECT * FROM users WHERE namespace = ?")
+      .get(req.params.namespace);
+    if (!user) {
+      res.status(404).json({ error: "User not found." });
+      return;
+    }
+    res.json(userResponse(user, db));
+  });
+
+  app.patch("/v2/users/:namespace", async (req, res) => {
+    const auth = authenticate(db, req.headers.authorization);
+    if (!auth) {
+      res.status(401).json({ error: "Unauthorized." });
+      return;
+    }
+    const target = db
+      .prepare("SELECT * FROM users WHERE namespace = ?")
+      .get(req.params.namespace);
+    if (!target) {
+      res.status(404).json({ error: "User not found." });
+      return;
+    }
+    if (auth.user.type !== "admin" && auth.user.id !== target.id) {
+      res.status(403).json({ error: "Forbidden." });
+      return;
+    }
+
+    const { displayName, password } = req.body || {};
+    if (displayName === undefined && password === undefined) {
+      res.status(400).json({ error: "At least one field is required." });
+      return;
+    }
+
+    if (displayName !== undefined && typeof displayName !== "string") {
+      res.status(400).json({ error: "displayName must be a string." });
+      return;
+    }
+    if (
+      password !== undefined &&
+      (typeof password !== "string" || password.length < 8)
+    ) {
+      res.status(400).json({
+        error: "password must be at least 8 characters.",
+      });
+      return;
+    }
+
+    if (displayName !== undefined) {
+      db.prepare("UPDATE users SET display_name = ? WHERE id = ?").run(
+        displayName,
+        target.id,
+      );
+    }
+    if (password !== undefined) {
+      const passwordHash = await hashPassword(password);
+      db.prepare("UPDATE users SET password_hash = ? WHERE id = ?").run(
+        passwordHash,
+        target.id,
+      );
+      db.prepare("DELETE FROM auth_tokens WHERE user_id = ?").run(target.id);
+    }
+
+    const updated = db
+      .prepare("SELECT * FROM users WHERE id = ?")
+      .get(target.id);
+    res.json(userResponse(updated, db));
+  });
+
+  app.delete("/v2/users/:namespace", (req, res) => {
+    const auth = authenticate(db, req.headers.authorization);
+    if (!auth) {
+      res.status(401).json({ error: "Unauthorized." });
+      return;
+    }
+    const target = db
+      .prepare("SELECT * FROM users WHERE namespace = ?")
+      .get(req.params.namespace);
+    if (!target) {
+      res.status(404).json({ error: "User not found." });
+      return;
+    }
+    if (auth.user.type !== "admin" && auth.user.id !== target.id) {
+      res.status(403).json({ error: "Forbidden." });
+      return;
+    }
+
+    const versions = db
+      .prepare(
+        `SELECT version, blob_path FROM versions
+         WHERE owner_id = ?`,
+      )
+      .all(target.id);
+
+    const deleteUser = db.transaction((id) => {
+      db.prepare("DELETE FROM auth_tokens WHERE user_id = ?").run(id);
+      db.prepare("DELETE FROM versions WHERE owner_id = ?").run(id);
+      db.prepare("DELETE FROM users WHERE id = ?").run(id);
+    });
+    deleteUser(target.id);
+
+    for (const v of versions) {
+      fs.rmSync(v.blob_path, { force: true });
+    }
+
+    res.status(200).json({ message: "Deleted." });
+  });
+
+  // ── Publish route ────────────────────────────────────────────────────
+
+  app.post("/v2/publish", (req, res, next) => {
+    const auth = authenticate(db, req.headers.authorization);
+    if (!auth) {
+      res.status(401).json({ error: "Unauthorized." });
+      return;
+    }
+
+    const { id, meta, extensionBlob } = req.body || {};
+    if (!id || typeof id !== "string") {
+      res.status(400).json({ error: "id is required." });
+      return;
+    }
+    if (!PACKAGE_ID_RE.test(id)) {
+      res.status(400).json({
+        error: "id must match ^[a-z0-9](?:[a-z0-9._-]{0,63})$.",
+      });
+      return;
+    }
+    if (!meta || typeof meta !== "object") {
+      res.status(400).json({ error: "meta is required." });
+      return;
+    }
+    if (!extensionBlob || typeof extensionBlob !== "string") {
+      res.status(400).json({ error: "extensionBlob is required." });
+      return;
+    }
+
+    const source = extensionBlob;
+    const {
+      ok,
+      meta: extractedMeta,
+      error: metaError,
+    } = extractWarpMeta(source);
     if (!ok) {
       res.status(400).json({ error: metaError });
       error(metaError);
       return;
     }
 
-    if (typeof meta.id !== "string" || !PACKAGE_ID_RE.test(meta.id)) {
+    if (extractedMeta.id !== id) {
       res.status(400).json({
-        error:
-          "meta.id is required and must match ^[a-z0-9](?:[a-z0-9._-]{0,63})$.",
+        error: "meta.id must match the request id.",
       });
-      error(
-        "meta.id is required and must match ^[a-z0-9](?:[a-z0-9._-]{0,63})$.",
-      );
       return;
     }
-    const version = semver.valid(meta.version);
+
+    const version = semver.valid(extractedMeta.version);
     if (version === null) {
       res.status(400).json({
         error: "meta.version must be a valid semver string.",
@@ -445,7 +833,10 @@ export function createApp({ db, dataDir, config = {} }) {
       return;
     }
     for (const field of ["name", "license", "description"]) {
-      if (typeof meta[field] !== "string" || meta[field].length === 0) {
+      if (
+        typeof extractedMeta[field] !== "string" ||
+        extractedMeta[field].length === 0
+      ) {
         res.status(400).json({
           error: `meta.${field} is required and must be a non-empty string.`,
         });
@@ -454,19 +845,34 @@ export function createApp({ db, dataDir, config = {} }) {
       }
     }
 
-    const packageId = meta.id;
-    const ownerName = owner.github_username;
+    const packageId = id;
+    const ownerName = auth.user.namespace;
 
     const existing = db
       .prepare(
         `SELECT id FROM versions WHERE owner_id = ? AND package_id = ? AND version = ?`,
       )
-      .get(owner.id, packageId, version);
+      .get(auth.user.id, packageId, version);
     if (existing) {
       res
         .status(409)
         .json({ error: "This version already exists for this owner." });
       error("This version already exists for this owner.");
+      return;
+    }
+
+    const pending = db
+      .prepare(
+        `SELECT id FROM versions
+         WHERE owner_id = ? AND status IN ('staging', 'pending')
+           AND NOT (package_id = ? AND version = ?)`,
+      )
+      .get(auth.user.id, packageId, version);
+    if (pending) {
+      res.status(403).json({
+        error:
+          "A publish from your account is already awaiting review. Wait for it to be approved before publishing again.",
+      });
       return;
     }
 
@@ -483,8 +889,8 @@ export function createApp({ db, dataDir, config = {} }) {
       const outcome = db
         .transaction(() => {
           const current = db
-            .prepare("SELECT has_published FROM owners WHERE id = ?")
-            .get(owner.id);
+            .prepare("SELECT has_published FROM users WHERE id = ?")
+            .get(auth.user.id);
           const derivedStatus =
             current.has_published === 1 ? "published" : "pending";
 
@@ -496,7 +902,7 @@ export function createApp({ db, dataDir, config = {} }) {
                  WHERE owner_id = ? AND status = 'pending'
                    AND NOT (package_id = ? AND version = ?)`,
               )
-              .get(owner.id, packageId, version);
+              .get(auth.user.id, packageId, version);
 
           if (blocked) return { blocked: true };
 
@@ -504,17 +910,17 @@ export function createApp({ db, dataDir, config = {} }) {
             `INSERT INTO versions (owner_id, package_id, version, status, final_status, meta_json, blob_path)
              VALUES (?, ?, ?, 'staging', ?, ?, ?)`,
           ).run(
-            owner.id,
+            auth.user.id,
             packageId,
             version,
             derivedStatus,
-            JSON.stringify(meta),
+            JSON.stringify(extractedMeta),
             absBlobPath,
           );
           fs.renameSync(tempBlobPath, absBlobPath);
           db.prepare(
             `UPDATE versions SET status = ? WHERE owner_id = ? AND package_id = ? AND version = ?`,
-          ).run(derivedStatus, owner.id, packageId, version);
+          ).run(derivedStatus, auth.user.id, packageId, version);
 
           return { status: derivedStatus };
         })
@@ -522,7 +928,7 @@ export function createApp({ db, dataDir, config = {} }) {
 
       if (outcome.blocked) {
         fs.rmSync(tempBlobPath, { force: true });
-        res.status(409).json({
+        res.status(403).json({
           error:
             "A publish from your account is already awaiting review. Wait for it to be approved before publishing again.",
         });
@@ -541,8 +947,8 @@ export function createApp({ db, dataDir, config = {} }) {
         fs.rmSync(absBlobPath, { force: true });
       }
       if (err.code === "SQLITE_CONSTRAINT_UNIQUE") {
-        if (isPendingConflict(err, db, owner.id, packageId, version)) {
-          res.status(409).json({
+        if (isPendingConflict(err, db, auth.user.id, packageId, version)) {
+          res.status(403).json({
             error:
               "A publish from your account is already awaiting review. Wait for it to be approved before publishing again.",
           });
@@ -561,19 +967,370 @@ export function createApp({ db, dataDir, config = {} }) {
       return;
     }
 
+    const versions = db
+      .prepare(
+        `SELECT version FROM versions
+         WHERE owner_id = ? AND package_id = ? AND status = 'published'
+         ORDER BY semverSortKey(version) DESC`,
+      )
+      .all(auth.user.id, packageId)
+      .map((r) => r.version);
+
     res.status(201).json({
-      owner: ownerName,
-      id: packageId,
-      version,
-      status: finalStatus,
-      url: `/v1/${ownerName}/${packageId}/${version}`,
+      extension: {
+        owner: ownerName,
+        id: packageId,
+        meta: extractedMeta,
+        versions,
+        approved: finalStatus === "published",
+      },
+      publishedUrl: `/v2/@${ownerName}/${packageId}`,
     });
 
     success(`${ownerName}/${packageId}@${version} (${finalStatus})`);
   });
 
+  // ── Extension info ───────────────────────────────────────────────────
+
+  app.get("/v2/@:namespace/:id", (req, res) => {
+    const { namespace, id } = req.params;
+    const rows = db
+      .prepare(
+        `SELECT v.version, v.meta_json, v.status
+         FROM versions v
+         JOIN users u ON u.id = v.owner_id
+         WHERE u.namespace = ? AND v.package_id = ? AND v.status = 'published'`,
+      )
+      .all(namespace, id);
+
+    if (rows.length === 0) {
+      res
+        .status(404)
+        .json({ error: "No published versions for this package." });
+      return;
+    }
+
+    rows.sort((a, b) => semver.compare(b.version, a.version));
+    const latest = rows[0];
+    const user = db
+      .prepare("SELECT id FROM users WHERE namespace = ?")
+      .get(namespace);
+
+    res.json({
+      owner: namespace,
+      id,
+      meta: JSON.parse(latest.meta_json),
+      versions: rows.map((r) => r.version),
+      approved: user
+        ? db
+            .prepare(
+              `SELECT 1 FROM versions
+               WHERE owner_id = ? AND package_id = ? AND status = 'published'`,
+            )
+            .get(user.id, id) !== undefined
+        : false,
+    });
+  });
+
+  // ── Update extension ─────────────────────────────────────────────────
+
+  app.patch("/v2/@:namespace/:id", (req, res) => {
+    const auth = authenticate(db, req.headers.authorization);
+    if (!auth) {
+      res.status(401).json({ error: "Unauthorized." });
+      return;
+    }
+
+    const { namespace, id } = req.params;
+    const target = db
+      .prepare("SELECT * FROM users WHERE namespace = ?")
+      .get(namespace);
+    if (!target) {
+      res.status(404).json({ error: "Extension not found." });
+      return;
+    }
+
+    const existingExt = db
+      .prepare(
+        `SELECT id FROM versions WHERE owner_id = ? AND package_id = ? AND status = 'published' LIMIT 1`,
+      )
+      .get(target.id, id);
+    if (!existingExt) {
+      res.status(404).json({ error: "Extension not found." });
+      return;
+    }
+
+    if (auth.user.type !== "admin" && auth.user.id !== target.id) {
+      res.status(403).json({ error: "Forbidden." });
+      return;
+    }
+
+    const { meta, extensionBlob } = req.body || {};
+    if (meta === undefined && extensionBlob === undefined) {
+      res.status(400).json({ error: "At least one field is required." });
+      return;
+    }
+
+    let finalMeta = meta;
+
+    if (extensionBlob !== undefined) {
+      if (typeof extensionBlob !== "string") {
+        res.status(400).json({ error: "extensionBlob must be a string." });
+        return;
+      }
+      const {
+        ok,
+        meta: extractedMeta,
+        error: metaError,
+      } = extractWarpMeta(extensionBlob);
+      if (!ok) {
+        res.status(400).json({ error: metaError });
+        return;
+      }
+      finalMeta = extractedMeta;
+
+      if (!PACKAGE_ID_RE.test(id)) {
+        res.status(400).json({
+          error: "id must match ^[a-z0-9](?:[a-z0-9._-]{0,63})$.",
+        });
+        return;
+      }
+      if (!finalMeta || typeof finalMeta !== "object") {
+        res
+          .status(400)
+          .json({ error: "meta is required when uploading a blob." });
+        return;
+      }
+      const version = semver.valid(finalMeta.version);
+      if (version === null) {
+        res.status(400).json({
+          error: "meta.version must be a valid semver string.",
+        });
+        return;
+      }
+      if (finalMeta.id !== id) {
+        res.status(400).json({ error: "meta.id must match the request id." });
+        return;
+      }
+
+      const absBlobPath = blobPath(dataDir, namespace, id, version);
+      fs.mkdirSync(path.dirname(absBlobPath), { recursive: true });
+      fs.writeFileSync(absBlobPath, extensionBlob);
+
+      const existingVersion = db
+        .prepare(
+          `SELECT id FROM versions WHERE owner_id = ? AND package_id = ? AND version = ?`,
+        )
+        .get(target.id, id, version);
+      if (existingVersion) {
+        db.prepare(
+          "UPDATE versions SET meta_json = ?, blob_path = ? WHERE id = ?",
+        ).run(JSON.stringify(finalMeta), absBlobPath, existingVersion.id);
+      } else {
+        const current = db
+          .prepare("SELECT has_published FROM users WHERE id = ?")
+          .get(target.id);
+        const derivedStatus =
+          current.has_published === 1 ? "published" : "pending";
+
+        const blocked =
+          current.has_published !== 1 &&
+          db
+            .prepare(
+              `SELECT id FROM versions
+               WHERE owner_id = ? AND status IN ('staging', 'pending')
+                 AND NOT (package_id = ? AND version = ?)`,
+            )
+            .get(target.id, id, version);
+        if (blocked) {
+          fs.rmSync(absBlobPath, { force: true });
+          res.status(409).json({
+            error:
+              "A publish from your account is already awaiting review. Wait for it to be approved before publishing again.",
+          });
+          return;
+        }
+
+        db.prepare(
+          `INSERT INTO versions (owner_id, package_id, version, status, final_status, meta_json, blob_path)
+           VALUES (?, ?, ?, 'staging', ?, ?, ?)`,
+        ).run(
+          target.id,
+          id,
+          version,
+          derivedStatus,
+          JSON.stringify(finalMeta),
+          absBlobPath,
+        );
+        db.prepare(
+          `UPDATE versions SET status = ? WHERE owner_id = ? AND package_id = ? AND version = ?`,
+        ).run(derivedStatus, target.id, id, version);
+      }
+    }
+
+    if (finalMeta) {
+      const latestRow = db
+        .prepare(
+          `SELECT v.id FROM versions v
+           WHERE v.owner_id = ? AND v.package_id = ? AND v.status = 'published'
+           ORDER BY semverSortKey(v.version) DESC LIMIT 1`,
+        )
+        .get(target.id, id);
+      if (latestRow) {
+        db.prepare("UPDATE versions SET meta_json = ? WHERE id = ?").run(
+          JSON.stringify(finalMeta),
+          latestRow.id,
+        );
+      }
+    }
+
+    const versions = db
+      .prepare(
+        `SELECT version FROM versions
+         WHERE owner_id = ? AND package_id = ? AND status = 'published'
+         ORDER BY semverSortKey(version) DESC`,
+      )
+      .all(target.id, id)
+      .map((r) => r.version);
+
+    const metaRow = db
+      .prepare(
+        `SELECT meta_json FROM versions
+         WHERE owner_id = ? AND package_id = ? AND status = 'published'
+         ORDER BY semverSortKey(version) DESC LIMIT 1`,
+      )
+      .get(target.id, id);
+
+    res.json({
+      owner: namespace,
+      id,
+      meta: metaRow ? JSON.parse(metaRow.meta_json) : finalMeta,
+      versions,
+      approved: true,
+    });
+  });
+
+  // ── Delete extension ─────────────────────────────────────────────────
+
+  app.delete("/v2/@:namespace/:id", (req, res) => {
+    const auth = authenticate(db, req.headers.authorization);
+    if (!auth) {
+      res.status(401).json({ error: "Unauthorized." });
+      return;
+    }
+
+    const { namespace, id } = req.params;
+    const target = db
+      .prepare("SELECT * FROM users WHERE namespace = ?")
+      .get(namespace);
+    if (!target) {
+      res.status(404).json({ error: "Extension not found." });
+      return;
+    }
+
+    const versions = db
+      .prepare(
+        `SELECT version, blob_path FROM versions
+         WHERE owner_id = ? AND package_id = ?`,
+      )
+      .all(target.id, id);
+    if (versions.length === 0) {
+      res.status(404).json({ error: "Extension not found." });
+      return;
+    }
+
+    if (auth.user.type !== "admin" && auth.user.id !== target.id) {
+      res.status(403).json({ error: "Forbidden." });
+      return;
+    }
+
+    for (const v of versions) {
+      fs.rmSync(v.blob_path, { force: true });
+    }
+    db.prepare(
+      "DELETE FROM versions WHERE owner_id = ? AND package_id = ?",
+    ).run(target.id, id);
+
+    res.status(200).json({ message: "Deleted." });
+  });
+
+  // ── Serve extension source by version ────────────────────────────────
+
+  app.get("/v2/@:namespace/:id/:version", (req, res) => {
+    const { namespace, id, version } = req.params;
+    if (version === "latest") {
+      const latest = findLatest(db, namespace, id);
+      if (!latest) {
+        res
+          .status(404)
+          .json({ error: "No published versions for this package." });
+        return;
+      }
+      serveBlob(req, res, {
+        db,
+        dataDir,
+        owner: namespace,
+        id,
+        version: latest.version,
+      });
+      return;
+    }
+    serveBlob(req, res, { db, dataDir, owner: namespace, id, version });
+  });
+
+  // ── Approve extension (admin only) ───────────────────────────────────
+
+  app.post("/v2/@:namespace/:id/approve", (req, res) => {
+    const auth = authenticate(db, req.headers.authorization);
+    if (!auth) {
+      res.status(401).json({ error: "Unauthorized." });
+      return;
+    }
+    if (auth.user.type !== "admin") {
+      res.status(403).json({ error: "Admin required." });
+      return;
+    }
+
+    const { namespace, id } = req.params;
+    const target = db
+      .prepare("SELECT * FROM users WHERE namespace = ?")
+      .get(namespace);
+    if (!target) {
+      res.status(404).json({ error: "Extension not found." });
+      return;
+    }
+
+    const latestPending = db
+      .prepare(
+        `SELECT id, version FROM versions
+         WHERE owner_id = ? AND package_id = ? AND status = 'pending'
+         ORDER BY semverSortKey(version) DESC LIMIT 1`,
+      )
+      .get(target.id, id);
+
+    if (!latestPending) {
+      res.status(404).json({ error: "No pending version found." });
+      return;
+    }
+
+    db.transaction(() => {
+      db.prepare(
+        `UPDATE versions SET status = 'published'
+         WHERE owner_id = ? AND package_id = ? AND status = 'pending'`,
+      ).run(target.id, id);
+      db.prepare("UPDATE users SET has_published = 1 WHERE id = ?").run(
+        target.id,
+      );
+    })();
+
+    success(`Approved ${namespace}/${id}@${latestPending.version}`);
+    res.status(200).json({ message: "Approved." });
+  });
+
+  // ── Search ───────────────────────────────────────────────────────────
+
   const latestPublishedSelections = `
-    SELECT o.github_username AS owner, v.package_id AS id,
+    SELECT u.namespace AS owner, v.package_id AS id,
            v.meta_json AS meta_json, v.version AS latestVersion,
            v.created_at AS created_at,
            ROW_NUMBER() OVER (
@@ -581,40 +1338,86 @@ export function createApp({ db, dataDir, config = {} }) {
              ORDER BY semverSortKey(v.version) DESC, v.id DESC
            ) AS rn
     FROM versions v
-    JOIN owners o ON o.id = v.owner_id
+    JOIN users u ON u.id = v.owner_id
     WHERE v.status = 'published'
   `;
 
-  app.get("/v1/search", (req, res) => {
-    const q = typeof req.query.q === "string" ? req.query.q.trim() : "";
-    if (!q) {
-      res.status(400).json({ error: "Missing required `q` query parameter." });
-      error("Missing required `q` query parameter.");
+  app.get("/v2/search", (req, res) => {
+    const raw = typeof req.query.query === "string" ? req.query.query : "";
+    const q = raw.trim();
+
+    const decodedCursor = decodeCursor(
+      req.query.cursor,
+      (d) =>
+        typeof d.createdAt === "string" &&
+        typeof d.owner === "string" &&
+        typeof d.packageId === "string",
+    );
+    if (!decodedCursor.ok) {
+      res.status(400).json({ error: "Invalid cursor." });
       return;
     }
-    const escaped = q
-      .replace(/\\/g, "\\\\")
-      .replace(/%/g, "\\%")
-      .replace(/_/g, "\\_");
-    const pattern = `%${escaped}%`;
+    const cursor = decodedCursor.value;
+
+    let where = "WHERE t.rn = 1";
+    const params = [];
+    if (cursor) {
+      where += ` AND (
+        t.created_at < ? OR
+        (t.created_at = ? AND (t.owner > ? OR (t.owner = ? AND t.id > ?)))
+      )`;
+      params.push(
+        cursor.createdAt,
+        cursor.createdAt,
+        cursor.owner,
+        cursor.owner,
+        cursor.packageId,
+      );
+    }
+
+    if (q) {
+      const escaped = q
+        .replace(/\\/g, "\\\\")
+        .replace(/%/g, "\\%")
+        .replace(/_/g, "\\_");
+      const pattern = `%${escaped}%`;
+      where += ` AND (unicode_fold(json_extract(t.meta_json, '$.name'))
+                LIKE unicode_fold(?) ESCAPE '\\'
+              OR json_extract(t.meta_json, '$.version') LIKE ? ESCAPE '\\'
+              OR json_extract(t.meta_json, '$.license') LIKE ? ESCAPE '\\'
+              OR json_extract(t.meta_json, '$.description') LIKE ? ESCAPE '\\'
+              OR t.id LIKE ? ESCAPE '\\'
+              OR t.owner LIKE ? ESCAPE '\\')`;
+      params.push(pattern, pattern, pattern, pattern, pattern, pattern);
+    }
+
     const rows = db
       .prepare(
-        `SELECT owner, id, meta_json, latestVersion
+        `SELECT owner, id, meta_json, latestVersion, created_at
          FROM (${latestPublishedSelections}) t
-         WHERE t.rn = 1
-           AND (unicode_fold(json_extract(t.meta_json, '$.name'))
-                  LIKE unicode_fold(?) ESCAPE '\\'
-             OR json_extract(t.meta_json, '$.version') LIKE ? ESCAPE '\\'
-             OR json_extract(t.meta_json, '$.license') LIKE ? ESCAPE '\\'
-             OR json_extract(t.meta_json, '$.description') LIKE ? ESCAPE '\\'
-             OR t.id LIKE ? ESCAPE '\\'
-             OR t.owner LIKE ? ESCAPE '\\')
+         ${where}
          ORDER BY t.created_at DESC, t.owner ASC, t.id ASC
-         LIMIT 10`,
+         LIMIT ?`,
       )
-      .all(pattern, pattern, pattern, pattern, pattern, pattern);
+      .all(...params, SEARCH_PAGE_SIZE + 1);
+
+    const hasMore = rows.length > SEARCH_PAGE_SIZE;
+    const page = rows.slice(0, SEARCH_PAGE_SIZE);
+
+    let nextCursor = null;
+    if (hasMore) {
+      const last = page[page.length - 1];
+      nextCursor = Buffer.from(
+        JSON.stringify({
+          createdAt: last.created_at,
+          owner: last.owner,
+          packageId: last.id,
+        }),
+      ).toString("base64");
+    }
+
     res.json({
-      results: rows.map((r) => {
+      results: page.map((r) => {
         const meta = JSON.parse(r.meta_json);
         return {
           owner: r.owner,
@@ -624,10 +1427,13 @@ export function createApp({ db, dataDir, config = {} }) {
           latestVersion: r.latestVersion,
         };
       }),
+      nextCursor,
     });
   });
 
-  app.get("/v1/packages", (req, res) => {
+  // ── Extensions ───────────────────────────────────────────────────────
+
+  app.get("/v2/extensions", (req, res) => {
     let limit = 20;
     if (req.query.limit !== undefined) {
       const parsed = Number(req.query.limit);
@@ -639,29 +1445,18 @@ export function createApp({ db, dataDir, config = {} }) {
     }
     limit = Math.min(limit, 50);
 
-    let cursor = null;
-    if (req.query.cursor !== undefined && req.query.cursor !== "") {
-      let decoded;
-      try {
-        decoded = JSON.parse(
-          Buffer.from(req.query.cursor, "base64").toString("utf8"),
-        );
-      } catch {
-        res.status(400).json({ error: "Invalid cursor." });
-        return;
-      }
-      if (
-        !decoded ||
-        typeof decoded !== "object" ||
-        typeof decoded.createdAt !== "string" ||
-        typeof decoded.owner !== "string" ||
-        typeof decoded.packageId !== "string"
-      ) {
-        res.status(400).json({ error: "Invalid cursor." });
-        return;
-      }
-      cursor = decoded;
+    const decodedCursor = decodeCursor(
+      req.query.cursor,
+      (d) =>
+        typeof d.createdAt === "string" &&
+        typeof d.owner === "string" &&
+        typeof d.packageId === "string",
+    );
+    if (!decodedCursor.ok) {
+      res.status(400).json({ error: "Invalid cursor." });
+      return;
     }
+    const cursor = decodedCursor.value;
 
     let where = "WHERE t.rn = 1";
     const params = [];
@@ -705,7 +1500,7 @@ export function createApp({ db, dataDir, config = {} }) {
     }
 
     res.json({
-      packages: page.map((r) => {
+      extensions: page.map((r) => {
         const meta = JSON.parse(r.meta_json);
         return {
           owner: r.owner,
@@ -713,14 +1508,16 @@ export function createApp({ db, dataDir, config = {} }) {
           name: meta.name,
           description: meta.description,
           latestVersion: r.latestVersion,
-          publishedAt: r.created_at,
+          publishedAt: `${r.created_at.replace(" ", "T")}Z`,
         };
       }),
       nextCursor,
     });
   });
 
-  app.get("/v1/stats", (req, res) => {
+  // ── Stats ────────────────────────────────────────────────────────────
+
+  app.get("/v2/stats", (_req, res) => {
     const published = db
       .prepare(
         `SELECT COUNT(*) AS c FROM (
@@ -744,59 +1541,9 @@ export function createApp({ db, dataDir, config = {} }) {
     res.json({ published, pending, authors });
   });
 
-  app.get("/v1/:owner/:id", (req, res) => {
-    const { owner, id } = req.params;
-    const rows = db
-      .prepare(
-        `SELECT v.version, v.meta_json
-         FROM versions v
-         JOIN owners o ON o.id = v.owner_id
-         WHERE o.github_username = ? AND v.package_id = ? AND v.status = 'published'`,
-      )
-      .all(owner, id);
+  // ── Error handling ───────────────────────────────────────────────────
 
-    if (rows.length === 0) {
-      res
-        .status(404)
-        .json({ error: "No published versions for this package." });
-      return;
-    }
-
-    rows.sort((a, b) => semver.compare(b.version, a.version));
-    const latest = rows[0];
-
-    res.json({
-      owner,
-      id,
-      latestVersion: latest.version,
-      meta: JSON.parse(latest.meta_json),
-      versions: rows.map((r) => r.version),
-    });
-  });
-
-  app.get("/v1/:owner/:id/:version", (req, res) => {
-    const { owner, id, version } = req.params;
-    if (version === "latest") {
-      const latest = findLatest(db, owner, id);
-      if (!latest) {
-        res
-          .status(404)
-          .json({ error: "No published versions for this package." });
-        return;
-      }
-      serveBlob(req, res, {
-        db,
-        dataDir,
-        owner,
-        id,
-        version: latest.version,
-      });
-      return;
-    }
-    serveBlob(req, res, { db, dataDir, owner, id, version });
-  });
-
-  app.use((err, req, res, next) => {
+  app.use((err, _req, res, next) => {
     if (err && err.type === "entity.parse.failed") {
       res.status(400).json({ error: "Malformed JSON body." });
       return;
@@ -843,7 +1590,6 @@ export function reconcileStagedVersions(db, dataDir) {
 
 /**
  * Cleans up stale temporary blob files that are no longer needed.
- * Removes temp files if their final versions don't exist or are not referenced.
  * @param {import('better-sqlite3').Database} db - The database instance.
  * @param {string} dataDir - The data directory path.
  */
@@ -884,7 +1630,7 @@ function collectFiles(dir) {
 /**
  * Finds the latest published version of a package.
  * @param {import('better-sqlite3').Database} db - The database instance.
- * @param {string} owner - The package owner's username.
+ * @param {string} owner - The package owner's namespace.
  * @param {string} id - The package identifier.
  * @returns {object|null} The latest version row, or null if no published versions exist.
  */
@@ -893,8 +1639,8 @@ function findLatest(db, owner, id) {
     .prepare(
       `SELECT v.version
        FROM versions v
-       JOIN owners o ON o.id = v.owner_id
-       WHERE o.github_username = ? AND v.package_id = ? AND v.status = 'published'`,
+       JOIN users u ON u.id = v.owner_id
+       WHERE u.namespace = ? AND v.package_id = ? AND v.status = 'published'`,
     )
     .all(owner, id);
   if (rows.length === 0) return null;
@@ -908,7 +1654,7 @@ function findLatest(db, owner, id) {
  * @param {import('express').Response} res - The Express response object.
  * @param {object} options - Options for serving the blob.
  * @param {import('better-sqlite3').Database} options.db - The database instance.
- * @param {string} options.owner - The package owner's username.
+ * @param {string} options.owner - The package owner's namespace.
  * @param {string} options.id - The package identifier.
  * @param {string} options.version - The package version.
  */
@@ -917,8 +1663,8 @@ function serveBlob(req, res, { db, owner, id, version }) {
     .prepare(
       `SELECT v.blob_path, v.status, v.version
        FROM versions v
-       JOIN owners o ON o.id = v.owner_id
-       WHERE o.github_username = ? AND v.package_id = ? AND v.version = ?`,
+       JOIN users u ON u.id = v.owner_id
+       WHERE u.namespace = ? AND v.package_id = ? AND v.version = ?`,
     )
     .get(owner, id, version);
 
@@ -935,130 +1681,4 @@ function serveBlob(req, res, { db, owner, id, version }) {
   res.setHeader("Content-Type", "application/javascript; charset=utf-8");
   res.setHeader("X-Content-Type-Options", "nosniff");
   res.sendFile(path.resolve(row.blob_path));
-}
-
-/**
- * Maximum allowed request body size in bytes (1MB).
- */
-const MAX_BODY_BYTES = 1024 * 1024;
-
-/**
- * Reads the raw body of a request as a UTF-8 string.
- * Enforces a maximum body size to prevent memory exhaustion.
- * @param {import('express').Request} req - The Express request object.
- * @param {number} [maxBytes=MAX_BODY_BYTES] - Maximum allowed body size in bytes.
- * @returns {Promise<string>} The request body as a string.
- */
-function readRawBody(req, maxBytes = MAX_BODY_BYTES) {
-  return new Promise((resolve, reject) => {
-    const chunks = [];
-    let size = 0;
-    req.on("data", (chunk) => {
-      size += chunk.length;
-      if (size > maxBytes) {
-        const err = new Error("Request body too large.");
-        err.statusCode = 413;
-        reject(err);
-        req.destroy();
-        return;
-      }
-      chunks.push(chunk);
-    });
-    req.on("end", () => {
-      if (req.destroyed) return;
-      resolve(Buffer.concat(chunks).toString("utf8"));
-    });
-    req.on("error", reject);
-  });
-}
-
-/**
- * Converts a hex string to a Buffer.
- * @param {string} hex - The hex string to convert.
- * @returns {Buffer|null} The Buffer, or null if the hex string is invalid.
- */
-function hexToBuffer(hex) {
-  if (typeof hex !== "string" || hex.length % 2 !== 0) return null;
-  return Buffer.from(hex, "hex");
-}
-
-/**
- * Returns the secret used for signing OAuth state cookies.
- * Falls back to client ID or a default if client secret is not configured.
- * @param {object} config - The configuration object.
- * @returns {string} The state secret.
- */
-function stateSecret(config) {
-  return (
-    config.GITHUB_CLIENT_SECRET || config.GITHUB_CLIENT_ID || "warp-registry"
-  );
-}
-
-/**
- * Sets an HttpOnly cookie containing the signed OAuth state.
- * @param {import('express').Response} res - The Express response object.
- * @param {string} state - The state value to sign and store.
- * @param {object} config - The configuration object.
- */
-function setStateCookie(res, state, config) {
-  const sig = crypto
-    .createHmac("sha256", stateSecret(config))
-    .update(state)
-    .digest("hex");
-  res.setHeader(
-    "Set-Cookie",
-    `warp_oauth_state=${state}.${sig}; HttpOnly; Path=/; SameSite=Lax; Max-Age=600`,
-  );
-}
-
-/**
- * Verifies the OAuth state cookie matches the provided state value.
- * Uses timing-safe comparison to prevent timing attacks.
- * @param {import('express').Request} req - The Express request object.
- * @param {string} state - The state value to verify.
- * @param {object} config - The configuration object.
- * @returns {boolean} True if the state is valid, false otherwise.
- */
-function verifyState(req, state, config) {
-  const header = req.headers.cookie || "";
-  for (const part of header.split(";")) {
-    const [name, value] = part.trim().split("=");
-    if (name !== "warp_oauth_state" || !value) continue;
-    const [cookieState, cookieSig] = value.split(".");
-    if (!cookieState || !cookieSig) return false;
-    if (cookieState !== state) return false;
-    const expected = crypto
-      .createHmac("sha256", stateSecret(config))
-      .update(cookieState)
-      .digest("hex");
-    const sigBuf = hexToBuffer(cookieSig);
-    const expBuf = hexToBuffer(expected);
-    if (!sigBuf || !expBuf || sigBuf.length !== expBuf.length) return false;
-    return crypto.timingSafeEqual(sigBuf, expBuf);
-  }
-  return false;
-}
-
-/**
- * Escapes HTML special characters to prevent XSS attacks.
- * @param {string} str - The string to escape.
- * @returns {string} The escaped string.
- */
-function escapeHtml(str) {
-  return String(str).replace(/[&<>"']/g, (c) => {
-    switch (c) {
-      case "&":
-        return "&amp;";
-      case "<":
-        return "&lt;";
-      case ">":
-        return "&gt;";
-      case '"':
-        return "&quot;";
-      case "'":
-        return "&#39;";
-      default:
-        return c;
-    }
-  });
 }
